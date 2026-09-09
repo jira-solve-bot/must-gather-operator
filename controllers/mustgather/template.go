@@ -30,8 +30,9 @@ const (
 
 	gatherCommandBinaryAudit   = "gather_audit_logs"
 	gatherCommandBinaryNoAudit = "gather"
-	gatherCommand              = "timeout %v bash -x -c -- '/usr/bin/%v' 2>&1 | tee /must-gather/must-gather.log\n\nstatus=$?\nif [[ $status -eq 124 || $status -eq 137 ]]; then\n  echo \"Gather timed out.\"\n  exit 0\nfi | tee -a /must-gather/must-gather.log"
+	gatherCommand              = "set -o pipefail\ntimeout %v bash -x -c -- '/usr/bin/%v' 2>&1 | tee /must-gather/must-gather.log\nstatus=$?\nif [[ $status -eq 124 || $status -eq 137 ]]; then\n  echo \"Gather timed out.\" | tee -a /must-gather/must-gather.log\n  status=0\nfi\necho \"$status\" > /must-gather/.gather-exit-code\n(exit $status)"
 	gatherContainerName        = "gather"
+	gatherExitCodeFile         = "/must-gather/.gather-exit-code"
 
 	// Environment variables for time-based log filtering
 	gatherEnvSince     = "MUST_GATHER_SINCE"
@@ -50,7 +51,7 @@ const (
 	uploadEnvMustGatherOutput = "must_gather_output"
 	uploadEnvMustGatherUpload = "must_gather_upload"
 	uploadEnvFilenamePrefix   = "FILENAME_PREFIX"
-	uploadCommand             = "count=0\nuntil [ $count -gt 4 ]\ndo\n  while `pgrep -a gather > /dev/null`\n  do\n    echo \"waiting for gathers to complete ...\"\n    sleep 120\n    count=0\n  done\n  echo \"no gather is running ($count / 4)\"\n  ((count++))\n  sleep 30\ndone\n/usr/local/bin/upload"
+	uploadCommand             = "count=0\nuntil [ $count -gt 4 ]\ndo\n  while `pgrep -a gather > /dev/null`\n  do\n    echo \"waiting for gathers to complete ...\"\n    sleep 120\n    count=0\n  done\n  echo \"no gather is running ($count / 4)\"\n  ((count++))\n  sleep 30\ndone\ngather_exit_file=\"/must-gather/.gather-exit-code\"\nif [ -f \"$gather_exit_file\" ]; then\n  gather_rc=$(cat \"$gather_exit_file\")\n  if [ \"$gather_rc\" != \"0\" ]; then\n    echo \"Error: gather failed with exit code $gather_rc. Skipping upload.\"\n    exit 1\n  fi\nelse\n  echo \"Error: gather exit code marker not found. Gather may have crashed. Skipping upload.\"\n  exit 1\nfi\n/usr/local/bin/upload"
 	uploadCommandDirect       = "/usr/local/bin/upload"
 
 	// SSH directory and known hosts file
@@ -337,21 +338,18 @@ func getGatherContainer(image string, audit bool, timeout time.Duration, storage
 	}
 
 	if len(command) > 0 {
+		exitCodeCapture := fmt.Sprintf("exit_code=$?\necho \"$exit_code\" > %s\n(exit $exit_code)", gatherExitCodeFile)
+		var wrappedCmd string
 		if shouldAppendObfuscateChown(obfuscate) {
-			// Wrap the custom command so chown still runs for the upload container (UID 65534).
-			// "$@" re-executes the original command+args with proper quoting preserved.
-			wrappedCmd := "\"$@\"\n" + obfuscateChownSuffix
-			container.Command = []string{"/bin/bash", "-c", wrappedCmd, "--"}
-			allArgs := make([]string, 0, len(command)+len(args))
-			allArgs = append(allArgs, command...)
-			allArgs = append(allArgs, args...)
-			container.Args = allArgs
+			wrappedCmd = fmt.Sprintf("\"$@\"\n%s\n%s", exitCodeCapture, obfuscateChownSuffix)
 		} else {
-			container.Command = command
-			if len(args) > 0 {
-				container.Args = args
-			}
+			wrappedCmd = fmt.Sprintf("\"$@\"\n%s", exitCodeCapture)
 		}
+		container.Command = []string{"/bin/bash", "-c", wrappedCmd, "--"}
+		allArgs := make([]string, 0, len(command)+len(args))
+		allArgs = append(allArgs, command...)
+		allArgs = append(allArgs, args...)
+		container.Args = allArgs
 	} else {
 		gatherCmd := fmt.Sprintf(gatherCommand, math.Ceil(timeout.Seconds()), commandBinary)
 		if shouldAppendObfuscateChown(obfuscate) {
