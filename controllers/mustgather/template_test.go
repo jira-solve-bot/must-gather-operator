@@ -232,16 +232,32 @@ func Test_getGatherContainer(t *testing.T) {
 				} else if !tt.audit && !strings.Contains(containerCommand, gatherCommandBinaryNoAudit) {
 					t.Fatalf("gather container command expected with binary %v but it wasn't present", gatherCommandBinaryNoAudit)
 				}
+				if !strings.HasPrefix(containerCommand, "set -o pipefail") {
+					t.Fatalf("expected gather command to start with 'set -o pipefail', got %q", containerCommand)
+				}
 				timeoutInSeconds := int(math.Ceil(tt.timeout.Seconds()))
-				if !strings.HasPrefix(containerCommand, fmt.Sprintf("timeout %d", timeoutInSeconds)) {
-					t.Fatalf("the duration was not properly added to the container command, got %v but wanted %v", strings.Split(containerCommand, " ")[1], timeoutInSeconds)
+				if !strings.Contains(containerCommand, fmt.Sprintf("timeout %d", timeoutInSeconds)) {
+					t.Fatalf("the duration was not properly added to the container command, got %v but wanted %v", containerCommand, timeoutInSeconds)
+				}
+				if !strings.Contains(containerCommand, gatherExitCodeFile) {
+					t.Fatalf("expected gather command to write exit code marker to %s", gatherExitCodeFile)
 				}
 			} else {
-				if !reflect.DeepEqual(container.Command, tt.command) {
-					t.Fatalf("expected container command %v but got %v", tt.command, container.Command)
+				if container.Command[0] != "/bin/bash" {
+					t.Fatalf("expected custom command to be wrapped in bash, got %v", container.Command)
 				}
-				if !reflect.DeepEqual(container.Args, tt.args) {
-					t.Fatalf("expected container args %v but got %v", tt.args, container.Args)
+				wrappedScript := container.Command[2]
+				if !strings.Contains(wrappedScript, "\"$@\"") {
+					t.Fatalf("expected wrapped script to contain \"$@\" passthrough, got %q", wrappedScript)
+				}
+				if !strings.Contains(wrappedScript, gatherExitCodeFile) {
+					t.Fatalf("expected exit code marker in wrapped script, got %q", wrappedScript)
+				}
+				expectedArgs := make([]string, 0, len(tt.command)+len(tt.args))
+				expectedArgs = append(expectedArgs, tt.command...)
+				expectedArgs = append(expectedArgs, tt.args...)
+				if !reflect.DeepEqual(container.Args, expectedArgs) {
+					t.Fatalf("expected container args %v but got %v", expectedArgs, container.Args)
 				}
 			}
 
@@ -665,8 +681,8 @@ func Test_getJobTemplate_ProxyAuditTimeout(t *testing.T) {
 					t.Fatalf("expected gather command to contain %v but got %v", gatherCommandBinaryNoAudit, gatherCmd)
 				}
 			}
-			if !strings.HasPrefix(gatherCmd, tt.wantTimeout) {
-				t.Fatalf("expected gather command to start with %q but got %q", tt.wantTimeout, gatherCmd)
+			if !strings.Contains(gatherCmd, tt.wantTimeout) {
+				t.Fatalf("expected gather command to contain %q but got %q", tt.wantTimeout, gatherCmd)
 			}
 
 			upload := findUploadContainerInJob(t, job)
@@ -1040,6 +1056,9 @@ func Test_getGatherContainer_ChownSuffix(t *testing.T) {
 	if !strings.Contains(wrappedScript, obfuscateChownSuffix) {
 		t.Fatalf("expected wrapped script to contain chown suffix, got %q", wrappedScript)
 	}
+	if !strings.Contains(wrappedScript, gatherExitCodeFile) {
+		t.Fatalf("expected wrapped script to write exit code marker, got %q", wrappedScript)
+	}
 	expectedArgs := []string{"/custom", "--flag"}
 	if len(containerCustomCmd.Args) != len(expectedArgs) {
 		t.Fatalf("expected %d args, got %d: %v", len(expectedArgs), len(containerCustomCmd.Args), containerCustomCmd.Args)
@@ -1051,8 +1070,21 @@ func Test_getGatherContainer_ChownSuffix(t *testing.T) {
 	}
 
 	containerCustomCmdNoObfuscate := getGatherContainer("img", false, 5*time.Second, nil, "", nil, []string{"/custom"}, nil, "", nil)
-	if len(containerCustomCmdNoObfuscate.Command) != 1 || containerCustomCmdNoObfuscate.Command[0] != "/custom" {
-		t.Fatalf("expected custom command to be preserved without obfuscate, got %v", containerCustomCmdNoObfuscate.Command)
+	if len(containerCustomCmdNoObfuscate.Command) != 4 || containerCustomCmdNoObfuscate.Command[0] != "/bin/bash" {
+		t.Fatalf("expected custom command to be wrapped in bash for exit code marker, got %v", containerCustomCmdNoObfuscate.Command)
+	}
+	noObfuscateScript := containerCustomCmdNoObfuscate.Command[2]
+	if !strings.Contains(noObfuscateScript, gatherExitCodeFile) {
+		t.Fatalf("expected exit code marker in wrapped script, got %q", noObfuscateScript)
+	}
+	if !strings.Contains(noObfuscateScript, "\"$@\"") {
+		t.Fatalf("expected \"$@\" passthrough in wrapped script, got %q", noObfuscateScript)
+	}
+	if strings.Contains(noObfuscateScript, obfuscateChownSuffix) {
+		t.Fatalf("expected no chown suffix without obfuscation, got %q", noObfuscateScript)
+	}
+	if len(containerCustomCmdNoObfuscate.Args) != 1 || containerCustomCmdNoObfuscate.Args[0] != "/custom" {
+		t.Fatalf("expected args [/custom], got %v", containerCustomCmdNoObfuscate.Args)
 	}
 }
 
@@ -1154,6 +1186,127 @@ func Test_outputSubPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_gatherExitCodePropagation(t *testing.T) {
+	t.Run("default command uses pipefail and writes exit code marker", func(t *testing.T) {
+		container := getGatherContainer("img", false, 5*time.Second, nil, "", nil, nil, nil, "", nil)
+		gatherCmd := container.Command[2]
+
+		if !strings.HasPrefix(gatherCmd, "set -o pipefail") {
+			t.Fatalf("expected gather command to start with 'set -o pipefail', got %q", gatherCmd)
+		}
+		if !strings.Contains(gatherCmd, gatherExitCodeFile) {
+			t.Fatalf("expected gather command to write exit code to %s, got %q", gatherExitCodeFile, gatherCmd)
+		}
+		if strings.Contains(gatherCmd, "fi | tee") {
+			t.Fatalf("gather command must not pipe the if block through tee (masks exit code), got %q", gatherCmd)
+		}
+		if !strings.Contains(gatherCmd, "(exit $status)") {
+			t.Fatalf("expected gather command to end with (exit $status) for proper exit code propagation, got %q", gatherCmd)
+		}
+	})
+
+	t.Run("default command with obfuscation writes marker before chown suffix", func(t *testing.T) {
+		container := getGatherContainer("img", false, 5*time.Second, nil, "", nil, nil, nil, "", &mustgatherv1.ObfuscateConfig{Enabled: ToPtr(true)})
+		gatherCmd := container.Command[2]
+
+		markerIdx := strings.Index(gatherCmd, gatherExitCodeFile)
+		chownIdx := strings.Index(gatherCmd, "chown -R 65534:65534")
+		if markerIdx < 0 || chownIdx < 0 {
+			t.Fatalf("expected both exit code marker and chown in command, got %q", gatherCmd)
+		}
+		if markerIdx > chownIdx {
+			t.Fatalf("exit code marker must be written before chown runs, got %q", gatherCmd)
+		}
+	})
+
+	t.Run("timeout handling preserves exit-0 behavior", func(t *testing.T) {
+		container := getGatherContainer("img", false, 30*time.Second, nil, "", nil, nil, nil, "", nil)
+		gatherCmd := container.Command[2]
+
+		if !strings.Contains(gatherCmd, "status -eq 124") || !strings.Contains(gatherCmd, "status -eq 137") {
+			t.Fatalf("expected timeout checks for 124 and 137, got %q", gatherCmd)
+		}
+		if !strings.Contains(gatherCmd, "status=0") {
+			t.Fatalf("expected timeout to reset status to 0, got %q", gatherCmd)
+		}
+	})
+}
+
+func Test_uploadCommandGatesOnGatherSuccess(t *testing.T) {
+	t.Run("upload command checks gather exit code marker", func(t *testing.T) {
+		if !strings.Contains(uploadCommand, ".gather-exit-code") {
+			t.Fatalf("expected uploadCommand to check gather exit code marker file")
+		}
+		if !strings.Contains(uploadCommand, "Skipping upload") {
+			t.Fatalf("expected uploadCommand to skip upload on gather failure")
+		}
+		if !strings.Contains(uploadCommand, "Gather may have crashed") {
+			t.Fatalf("expected uploadCommand to handle missing marker file (gather crash)")
+		}
+	})
+
+	t.Run("direct upload command unchanged for obfuscate source mode", func(t *testing.T) {
+		if strings.Contains(uploadCommandDirect, ".gather-exit-code") {
+			t.Fatalf("uploadCommandDirect should not check gather exit code (no gather container in source mode)")
+		}
+		if uploadCommandDirect != "/usr/local/bin/upload" {
+			t.Fatalf("uploadCommandDirect should be unchanged, got %q", uploadCommandDirect)
+		}
+	})
+
+	t.Run("upload container uses gate when gather container exists", func(t *testing.T) {
+		t.Setenv(DefaultMustGatherImageEnv, "quay.io/foo/bar/must-gather:latest")
+
+		mg := mustgatherv1.MustGather{
+			ObjectMeta: metav1.ObjectMeta{Name: "mg", Namespace: "ns"},
+			Spec: mustgatherv1.MustGatherSpec{
+				ServiceAccountName: "default",
+				UploadTarget: &mustgatherv1.UploadTargetSpec{
+					Type: mustgatherv1.UploadTypeSFTP,
+					SFTP: &mustgatherv1.SFTPSpec{
+						CaseID: "1234",
+						Host:   ptr.To("sftp.example.com"),
+						CaseManagementAccountSecretRef: v1.LocalObjectReference{
+							Name: "case-mgmt-secret",
+						},
+					},
+				},
+			},
+		}
+		job := getJobTemplate("img", "operator-image", mg, "", "dir")
+		upload := findUploadContainerInJob(t, job)
+		uploadCmd := upload.Command[2]
+
+		if !strings.Contains(uploadCmd, ".gather-exit-code") {
+			t.Fatalf("expected upload command to check gather exit code marker, got %q", uploadCmd)
+		}
+	})
+
+	t.Run("obfuscate source mode uses direct upload without gather gate", func(t *testing.T) {
+		t.Setenv(DefaultMustGatherImageEnv, "quay.io/foo/bar/must-gather:latest")
+
+		mg := mustgatherv1.MustGather{
+			ObjectMeta: metav1.ObjectMeta{Name: "mg", Namespace: "ns"},
+			Spec: mustgatherv1.MustGatherSpec{
+				ServiceAccountName: "default",
+				Obfuscate: &mustgatherv1.ObfuscateConfig{
+					Enabled: ToPtr(true),
+					Source: &mustgatherv1.PersistentVolumeConfig{
+						Claim: mustgatherv1.PersistentVolumeClaimReference{Name: "existing-pvc"},
+					},
+				},
+			},
+		}
+		job := getJobTemplate("img", "operator-image", mg, "", "dir")
+		upload := findUploadContainerInJob(t, job)
+		uploadCmd := upload.Command[2]
+
+		if strings.Contains(uploadCmd, ".gather-exit-code") {
+			t.Fatalf("obfuscate.source mode should not check gather exit code (no gather container), got %q", uploadCmd)
+		}
+	})
 }
 
 // helper to find gather container in a job
